@@ -1,0 +1,95 @@
+name: "DevSecOps Container CI Pipeline"
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write # Required for Cosign OIDC identity token keyless signing
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  secret-scan:
+    name: "Secret Security Scan (Gitleaks)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Gitleaks needs full history to scan commits
+
+      - name: Run Gitleaks Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Note: Set fail-on-leak to true to enforce blocking builds containing secrets
+
+  dependency-scan:
+    name: "Dependency SCA Scan (Trivy)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy SCA Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          vuln-type: 'library'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '0' # Audit only for libraries, fail on container image stage
+
+  build-and-secure:
+    name: "Build & Scan Container"
+    needs: [secret-scan, dependency-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Local Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true # Load image locally on runner to scan it before pushing
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan Image for Vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest'
+          format: 'table'
+          severity: 'CRITICAL'
+          exit-code: '1' # Fail the pipeline if CRITICAL vulnerabilities exist in the image
+
+      # ====================================================================
+      # Cryptographic Image Signing with Cosign (Keyless Sigstore OIDC)
+      # ====================================================================
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.4.0
+
+      - name: Sign Container Metadata (Demonstration)
+        run: |
+          # In a live environment, you would log into your container registry, 
+          # push the image, and sign the remote digest:
+          #
+          # echo "Signing image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          # cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
+          
+          cosign version
